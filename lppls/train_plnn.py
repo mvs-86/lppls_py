@@ -35,17 +35,14 @@ import time
 import argparse
 import logging
 from pathlib import Path
-from typing import Literal
 
 import tensorflow as tf
 import keras
 
 from .plnn import build_plnn, plnn_loss
-from .dataset import make_tf_dataset, N_TRAIN, N_VAL
+from .dataset import make_tf_dataset, N_TRAIN, N_VAL, SERIES_LEN, NoiseType
 
 logger = logging.getLogger(__name__)
-
-NoiseType = Literal["white", "ar1", "both"]
 
 # ── Hyperparameters (spec §6.4) ────────────────────────────────────────────
 _LR         = 1e-5
@@ -128,17 +125,23 @@ class _EpochTimer(keras.callbacks.Callback):
         logger.info("  Throughput: %.0f samples/sec  (%.1fs/epoch)", sps, elapsed)
 
 
+def _log_gpu_util(label: str = "") -> None:
+    """Log per-GPU utilisation from nvidia-smi; silently skips if unavailable."""
+    tag = f" [{label}]" if label else ""
+    for gpu in _query_gpu_util():
+        logger.info(
+            "  GPU %s (%s)%s: compute=%d%%  mem=%d%%  (%d/%d MiB)",
+            gpu["index"], gpu["name"], tag,
+            gpu["gpu_pct"], gpu["mem_pct"],
+            gpu["mem_used_mib"], gpu["mem_total_mib"],
+        )
+
+
 class _GPUUtilLogger(keras.callbacks.Callback):
     """Logs GPU compute & memory utilisation via nvidia-smi after each epoch."""
 
     def on_epoch_end(self, epoch: int, logs=None) -> None:
-        for gpu in _query_gpu_util():
-            logger.info(
-                "  GPU %s (%s): compute=%d%%  mem=%d%%  (%d/%d MiB)",
-                gpu["index"], gpu["name"],
-                gpu["gpu_pct"], gpu["mem_pct"],
-                gpu["mem_used_mib"], gpu["mem_total_mib"],
-            )
+        _log_gpu_util()
 
 
 def train_plnn(
@@ -227,20 +230,15 @@ def train_plnn(
     logger.info(
         "Datasets ready in %.1fs  (~%.0f MB RAM)",
         time.perf_counter() - t_data,
-        (n_train + n_val) * 252 * 4 / 1e6,
+        (n_train + n_val) * SERIES_LEN * 4 / 1e6,
     )
 
     # Log baseline GPU state before any training compute
-    for gpu in _query_gpu_util():
-        logger.info(
-            "  GPU %s (%s) [baseline]: compute=%d%%  mem=%d/%d MiB",
-            gpu["index"], gpu["name"],
-            gpu["gpu_pct"], gpu["mem_used_mib"], gpu["mem_total_mib"],
-        )
+    _log_gpu_util("baseline")
 
     # ── Model ─────────────────────────────────────────────────────────────
     with strategy.scope():
-        model = build_plnn(input_size=252)
+        model = build_plnn(input_size=SERIES_LEN)
         # global_clipnorm prevents float16 gradient overflow with mixed_float16:
         # the default LossScaleOptimizer starts at scale 2^15, which pushes
         # float16 gradients (max ~65504) to inf → NaN → skipped updates.
@@ -258,6 +256,15 @@ def train_plnn(
     callbacks = [
         timer,
         _GPUUtilLogger(),
+        # Halve LR when val_loss stalls for 3 epochs; prevents premature plateau
+        # at a fixed lr=1e-5 across all 20 epochs.
+        keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-8,
+            verbose=0,
+        ),
         keras.callbacks.ModelCheckpoint(
             filepath=str(checkpoint_path),
             monitor="val_loss",

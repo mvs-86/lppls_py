@@ -33,19 +33,26 @@ def build_plnn(input_size: int = _INPUT_SIZE) -> keras.Model:
     -------
     keras.Model
         Uncompiled model with output shape (batch, 3).
+
+    Notes
+    -----
+    Call this inside ``strategy.scope()`` when using MirroredStrategy so that
+    Variables are placed correctly across replicas.
+
+    He normal initialisation is used for all ReLU layers; it preserves signal
+    variance through depth better than Glorot uniform (Kaiming He et al., 2015).
     """
-    strategy = tf.distribute.get_strategy()
-
-    with strategy.scope():
-        inputs = keras.Input(shape=(input_size,), name="series_input")
-        h1 = layers.Dense(input_size, activation="relu", name="hidden_1")(inputs)
-        h2 = layers.Dense(input_size, activation="relu", name="hidden_2")(h1)
-        h3 = layers.Dense(input_size, activation="relu", name="hidden_3")(h2)
-        h4 = layers.Dense(input_size, activation="relu", name="hidden_4")(h3)
-        outputs = layers.Dense(3, activation="linear", name="output")(h4)
-        model = keras.Model(inputs=inputs, outputs=outputs, name="P_LNN")
-
-    return model
+    inputs = keras.Input(shape=(input_size,), name="series_input")
+    h1 = layers.Dense(input_size, activation="relu",
+                      kernel_initializer="he_normal", name="hidden_1")(inputs)
+    h2 = layers.Dense(input_size, activation="relu",
+                      kernel_initializer="he_normal", name="hidden_2")(h1)
+    h3 = layers.Dense(input_size, activation="relu",
+                      kernel_initializer="he_normal", name="hidden_3")(h2)
+    h4 = layers.Dense(input_size, activation="relu",
+                      kernel_initializer="he_normal", name="hidden_4")(h3)
+    outputs = layers.Dense(3, activation="linear", name="output")(h4)
+    return keras.Model(inputs=inputs, outputs=outputs, name="P_LNN")
 
 
 def plnn_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
@@ -66,4 +73,5 @@ def plnn_loss(y_true: tf.Tensor, y_pred: tf.Tensor) -> tf.Tensor:
     # but labels are always float32 — mismatched dtypes cause Sub to fail.
     y_true = tf.cast(y_true, tf.float32)
     y_pred = tf.cast(y_pred, tf.float32)
-    return tf.reduce_mean(tf.reduce_mean(tf.square(y_true - y_pred), axis=-1))
+    # Single reduce_mean over all elements == MSE (spec §6.3).
+    return tf.reduce_mean(tf.square(y_true - y_pred))

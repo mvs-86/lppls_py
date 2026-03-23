@@ -30,11 +30,16 @@ pregenerate=False
 
 from __future__ import annotations
 
+from typing import Generator, Literal
+
 import numpy as np
 import tensorflow as tf
 
 from .formula import lppls_reformulated
 from .data_gen import add_white_noise, add_ar1_noise
+
+# Exported type alias so all modules share a single source of truth.
+NoiseType = Literal["white", "ar1", "both"]
 
 # Fixed series length for P-LNN (spec §6.1)
 SERIES_LEN = 252
@@ -131,6 +136,21 @@ def generate_plnn_sample(
     return series, label
 
 
+def _sample_stream(
+    noise_type: str,
+    rng: np.random.Generator,
+    n_samples: int,
+) -> Generator[tuple[np.ndarray, np.ndarray], None, None]:
+    """Yield exactly *n_samples* valid (series, label) pairs, retrying on None."""
+    yielded = 0
+    while yielded < n_samples:
+        result = generate_plnn_sample(noise_type, rng)
+        if result is None:
+            continue
+        yield result
+        yielded += 1
+
+
 def pregenerate_arrays(
     noise_type: str,
     n_samples: int,
@@ -153,13 +173,9 @@ def pregenerate_arrays(
     X = np.empty((n_samples, SERIES_LEN), dtype=np.float32)
     Y = np.empty((n_samples, 3),          dtype=np.float32)
     rng = np.random.default_rng(seed)
-    i = 0
-    while i < n_samples:
-        result = generate_plnn_sample(noise_type, rng)
-        if result is None:
-            continue
-        X[i], Y[i] = result
-        i += 1
+    for i, (series, label) in enumerate(_sample_stream(noise_type, rng, n_samples)):
+        X[i] = series
+        Y[i] = label
     return X, Y
 
 
@@ -208,13 +224,7 @@ def make_tf_dataset(
         # ── Legacy streaming path ──────────────────────────────────────────
         def generator():
             rng = np.random.default_rng(seed)
-            yielded = 0
-            while yielded < n_samples:
-                result = generate_plnn_sample(noise_type, rng)
-                if result is None:
-                    continue
-                yield result
-                yielded += 1
+            yield from _sample_stream(noise_type, rng, n_samples)
 
         ds = tf.data.Dataset.from_generator(
             generator,
