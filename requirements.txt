@@ -1,0 +1,4 @@
+numpy>=1.24
+tensorflow>=2.13
+keras>=2.13
+pytest>=7.4
