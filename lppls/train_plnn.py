@@ -29,14 +29,12 @@ Usage (API)
 
 from __future__ import annotations
 
-import os
 import time
 import argparse
 import logging
 from pathlib import Path
 from typing import Literal
 
-import numpy as np
 import tensorflow as tf
 import keras
 
@@ -44,7 +42,6 @@ from .plnn import build_plnn, plnn_loss
 from .dataset import make_tf_dataset, N_TRAIN, N_VAL
 
 logger = logging.getLogger(__name__)
-
 
 NoiseType = Literal["white", "ar1", "both"]
 
@@ -79,6 +76,21 @@ def _enable_mixed_precision() -> None:
         logger.info("Mixed precision skipped (no GPU)")
 
 
+class _EpochTimer(keras.callbacks.Callback):
+    """Records wall-clock time per epoch."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.epoch_times: list[float] = []
+        self._t0: float = 0.0
+
+    def on_epoch_begin(self, epoch: int, logs=None) -> None:
+        self._t0 = time.perf_counter()
+
+    def on_epoch_end(self, epoch: int, logs=None) -> None:
+        self.epoch_times.append(time.perf_counter() - self._t0)
+
+
 def train_plnn(
     noise_type: NoiseType = "white",
     output_path: str | Path | None = None,
@@ -98,7 +110,7 @@ def train_plnn(
         Noise augmentation variant (spec §7.4).
     output_path : str or Path, optional
         Where to save the trained model (.keras format).
-        Defaults to  ``models/plnn_{noise_type}.keras``.
+        Defaults to ``models/plnn_{noise_type}.keras``.
     epochs : int
         Training epochs (spec: 20).
     batch_size : int
@@ -118,10 +130,10 @@ def train_plnn(
     -------
     dict
         Training history with keys:
-          "train_loss" : list[float]  (per epoch)
-          "val_loss"   : list[float]  (per epoch)
-          "epoch_times": list[float]  (seconds per epoch)
-          "best_epoch" : int
+          "train_loss"   : list[float]  (per epoch)
+          "val_loss"     : list[float]  (per epoch)
+          "epoch_times"  : list[float]  (seconds per epoch)
+          "best_epoch"   : int
           "best_val_loss": float
     """
     if output_path is None:
@@ -156,87 +168,63 @@ def train_plnn(
     # ── Model ─────────────────────────────────────────────────────────────
     with strategy.scope():
         model = build_plnn(input_size=252)
-        optimizer = keras.optimizers.Adam(learning_rate=lr)
-        model.compile(optimizer=optimizer, loss=plnn_loss)
+        model.compile(
+            optimizer=keras.optimizers.Adam(learning_rate=lr),
+            loss=plnn_loss,
+        )
 
     logger.info("Model parameters: %s", f"{model.count_params():,}")
 
-    # ── Training loop ─────────────────────────────────────────────────────
-    history: dict = {
-        "train_loss":   [],
-        "val_loss":     [],
-        "epoch_times":  [],
-        "best_epoch":   0,
-        "best_val_loss": float("inf"),
-    }
-
-    best_weights: list | None = None
+    # ── Callbacks ─────────────────────────────────────────────────────────
     checkpoint_path = output_path.with_suffix(".ckpt.keras")
+    timer = _EpochTimer()
+    callbacks = [
+        timer,
+        keras.callbacks.ModelCheckpoint(
+            filepath=str(checkpoint_path),
+            monitor="val_loss",
+            save_best_only=True,
+            verbose=0,
+        ),
+    ]
 
-    for epoch in range(1, epochs + 1):
-        t0 = time.perf_counter()
+    # ── Training ──────────────────────────────────────────────────────────
+    # .repeat() makes the generators infinite; steps_per_epoch/validation_steps
+    # tell Keras where each epoch boundary is.
+    effective_batch = batch_size * strategy.num_replicas_in_sync
+    steps_per_epoch  = n_train // effective_batch
+    validation_steps = n_val   // effective_batch
 
-        train_loss = _run_epoch(model, train_ds, optimizer, training=True)
-        val_loss   = _run_epoch(model, val_ds,   optimizer, training=False)
+    keras_history = model.fit(
+        train_ds.repeat(),
+        validation_data=val_ds.repeat(),
+        epochs=epochs,
+        steps_per_epoch=steps_per_epoch,
+        validation_steps=validation_steps,
+        callbacks=callbacks,
+        verbose=1,
+    )
 
-        elapsed = time.perf_counter() - t0
-        history["train_loss"].append(train_loss)
-        history["val_loss"].append(val_loss)
-        history["epoch_times"].append(elapsed)
-
-        logger.info(
-            "Epoch %2d/%d  train_loss=%.6f  val_loss=%.6f  (%.1fs)",
-            epoch, epochs, train_loss, val_loss, elapsed,
-        )
-
-        # Best-model checkpoint
-        if val_loss < history["best_val_loss"]:
-            history["best_val_loss"] = val_loss
-            history["best_epoch"]    = epoch
-            best_weights = [w.numpy().copy() for w in model.weights]
-            model.save(checkpoint_path)
-            logger.info("  ↳ New best — checkpoint saved")
-
-    # Restore best weights and save final model
-    if best_weights is not None:
-        for w, val in zip(model.weights, best_weights):
-            w.assign(val)
+    # Load best weights, save to final path, clean up checkpoint
+    if checkpoint_path.exists():
+        model = keras.models.load_model(checkpoint_path, compile=False)
+        checkpoint_path.unlink()
 
     model.save(output_path)
     logger.info("Saved final model → %s", output_path)
 
-    # Clean up checkpoint
-    if checkpoint_path.exists():
-        checkpoint_path.unlink()
+    # ── Build history dict ─────────────────────────────────────────────────
+    train_losses = keras_history.history["loss"]
+    val_losses   = keras_history.history["val_loss"]
+    best_epoch   = int(val_losses.index(min(val_losses))) + 1  # 1-based
 
-    return history
-
-
-def _run_epoch(
-    model: keras.Model,
-    dataset: tf.data.Dataset,
-    optimizer: keras.optimizers.Optimizer,
-    training: bool,
-) -> float:
-    """Run one epoch; return mean loss."""
-    total_loss = 0.0
-    n_batches  = 0
-
-    for x_batch, y_batch in dataset:
-        if training:
-            with tf.GradientTape() as tape:
-                y_pred = model(x_batch, training=True)
-                loss   = plnn_loss(y_batch, y_pred)
-            grads = tape.gradient(loss, model.trainable_variables)
-            optimizer.apply_gradients(zip(grads, model.trainable_variables))
-        else:
-            y_pred = model(x_batch, training=False)
-            loss   = plnn_loss(y_batch, y_pred)
-
-        total_loss += float(loss.numpy())
-        n_batches  += 1
-
-    return total_loss / max(n_batches, 1)
+    return {
+        "train_loss":    train_losses,
+        "val_loss":      val_losses,
+        "epoch_times":   timer.epoch_times,
+        "best_epoch":    best_epoch,
+        "best_val_loss": min(val_losses),
+    }
 
 
 # ── CLI entry-point ────────────────────────────────────────────────────────
