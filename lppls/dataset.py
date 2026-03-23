@@ -172,4 +172,8 @@ def make_tf_dataset(
     if shuffle:
         ds = ds.shuffle(buffer_size=min(n_samples, 10_000), seed=seed)
 
-    return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    # drop_remainder=True ensures every batch has exactly batch_size samples.
+    # Without it, the shuffle buffer can carry leftover samples across the
+    # generator's repeat boundary, creating uneven per-replica sub-batches
+    # that cause AddN shape mismatches in MirroredStrategy gradient aggregation.
+    return ds.batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)

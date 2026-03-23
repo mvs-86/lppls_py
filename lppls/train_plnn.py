@@ -168,8 +168,12 @@ def train_plnn(
     # ── Model ─────────────────────────────────────────────────────────────
     with strategy.scope():
         model = build_plnn(input_size=252)
+        # global_clipnorm prevents float16 gradient overflow with mixed_float16:
+        # the default LossScaleOptimizer starts at scale 2^15, which pushes
+        # float16 gradients (max ~65504) to inf → NaN → skipped updates.
+        # Clipping before unscaling keeps gradients finite every step.
         model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=lr),
+            optimizer=keras.optimizers.Adam(learning_rate=lr, global_clipnorm=1.0),
             loss=plnn_loss,
         )
 
