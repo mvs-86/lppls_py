@@ -3,10 +3,11 @@ Full P-LNN training pipeline (spec §6.4).
 
 Training procedure
 ------------------
-- Optimizer  : Adam, lr = 1e-5  (spec §6.4)
-- Epochs     : 20               (spec §6.4)
-- Batch size : 8                (spec §6.4)
+- Optimizer  : Adam, lr = 1e-5, global_clipnorm=1.0  (spec §6.4)
+- Epochs     : 20                                     (spec §6.4)
+- Batch size : 8                                      (spec §6.4)
 - Dataset    : 100,000 training + 33,333 validation synthetic LPPLS series
+               pre-generated into RAM (from_tensor_slices) to saturate GPU
 - Loss       : MSE on {tc, m, omega} labels  (spec §6.3)
 - GPU        : tf.distribute.MirroredStrategy (multi-GPU transparent)
 - Mixed prec : enabled via keras policy "mixed_float16" when GPU available
@@ -29,6 +30,7 @@ Usage (API)
 
 from __future__ import annotations
 
+import subprocess
 import time
 import argparse
 import logging
@@ -76,19 +78,67 @@ def _enable_mixed_precision() -> None:
         logger.info("Mixed precision skipped (no GPU)")
 
 
-class _EpochTimer(keras.callbacks.Callback):
-    """Records wall-clock time per epoch."""
+def _query_gpu_util() -> list[dict]:
+    """Return per-GPU utilisation stats from nvidia-smi, or [] if unavailable."""
+    try:
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,utilization.gpu,utilization.memory,"
+                "memory.used,memory.total",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return []
+        rows = []
+        for line in result.stdout.strip().splitlines():
+            idx, name, gpu_pct, mem_pct, mem_used, mem_total = [
+                p.strip() for p in line.split(",")
+            ]
+            rows.append({
+                "index": idx, "name": name,
+                "gpu_pct": int(gpu_pct), "mem_pct": int(mem_pct),
+                "mem_used_mib": int(mem_used), "mem_total_mib": int(mem_total),
+            })
+        return rows
+    except Exception:
+        return []
 
-    def __init__(self) -> None:
+
+class _EpochTimer(keras.callbacks.Callback):
+    """Records wall-clock time and samples/sec per epoch."""
+
+    def __init__(self, n_train: int) -> None:
         super().__init__()
+        self.n_train = n_train
         self.epoch_times: list[float] = []
+        self.throughput:  list[float] = []
         self._t0: float = 0.0
 
     def on_epoch_begin(self, epoch: int, logs=None) -> None:
         self._t0 = time.perf_counter()
 
     def on_epoch_end(self, epoch: int, logs=None) -> None:
-        self.epoch_times.append(time.perf_counter() - self._t0)
+        elapsed = time.perf_counter() - self._t0
+        sps = self.n_train / elapsed
+        self.epoch_times.append(elapsed)
+        self.throughput.append(sps)
+        logger.info("  Throughput: %.0f samples/sec  (%.1fs/epoch)", sps, elapsed)
+
+
+class _GPUUtilLogger(keras.callbacks.Callback):
+    """Logs GPU compute & memory utilisation via nvidia-smi after each epoch."""
+
+    def on_epoch_end(self, epoch: int, logs=None) -> None:
+        for gpu in _query_gpu_util():
+            logger.info(
+                "  GPU %s (%s): compute=%d%%  mem=%d%%  (%d/%d MiB)",
+                gpu["index"], gpu["name"],
+                gpu["gpu_pct"], gpu["mem_pct"],
+                gpu["mem_used_mib"], gpu["mem_total_mib"],
+            )
 
 
 def train_plnn(
@@ -133,6 +183,7 @@ def train_plnn(
           "train_loss"   : list[float]  (per epoch)
           "val_loss"     : list[float]  (per epoch)
           "epoch_times"  : list[float]  (seconds per epoch)
+          "throughput"   : list[float]  (samples/sec per epoch)
           "best_epoch"   : int
           "best_val_loss": float
     """
@@ -146,24 +197,46 @@ def train_plnn(
 
     strategy = _setup_strategy()
 
-    # ── Datasets ──────────────────────────────────────────────────────────
-    logger.info("Building training dataset (%d samples, noise=%s) …", n_train, noise_type)
+    # ── Datasets (pre-generated into RAM) ─────────────────────────────────
+    effective_batch = batch_size * strategy.num_replicas_in_sync
+
+    t_data = time.perf_counter()
+    logger.info(
+        "Pre-generating training dataset (%d samples, noise=%s) …",
+        n_train, noise_type,
+    )
     train_ds = make_tf_dataset(
         noise_type=noise_type,
         n_samples=n_train,
-        batch_size=batch_size * strategy.num_replicas_in_sync,
+        batch_size=effective_batch,
         seed=seed,
         shuffle=True,
+        pregenerate=True,
     )
-
-    logger.info("Building validation dataset (%d samples) …", n_val)
+    logger.info(
+        "Pre-generating validation dataset (%d samples) …", n_val,
+    )
     val_ds = make_tf_dataset(
         noise_type=noise_type,
         n_samples=n_val,
-        batch_size=batch_size * strategy.num_replicas_in_sync,
+        batch_size=effective_batch,
         seed=(seed + 1) if seed is not None else None,
         shuffle=False,
+        pregenerate=True,
     )
+    logger.info(
+        "Datasets ready in %.1fs  (~%.0f MB RAM)",
+        time.perf_counter() - t_data,
+        (n_train + n_val) * 252 * 4 / 1e6,
+    )
+
+    # Log baseline GPU state before any training compute
+    for gpu in _query_gpu_util():
+        logger.info(
+            "  GPU %s (%s) [baseline]: compute=%d%%  mem=%d/%d MiB",
+            gpu["index"], gpu["name"],
+            gpu["gpu_pct"], gpu["mem_used_mib"], gpu["mem_total_mib"],
+        )
 
     # ── Model ─────────────────────────────────────────────────────────────
     with strategy.scope():
@@ -181,9 +254,10 @@ def train_plnn(
 
     # ── Callbacks ─────────────────────────────────────────────────────────
     checkpoint_path = output_path.with_suffix(".ckpt.keras")
-    timer = _EpochTimer()
+    timer = _EpochTimer(n_train=n_train)
     callbacks = [
         timer,
+        _GPUUtilLogger(),
         keras.callbacks.ModelCheckpoint(
             filepath=str(checkpoint_path),
             monitor="val_loss",
@@ -193,18 +267,12 @@ def train_plnn(
     ]
 
     # ── Training ──────────────────────────────────────────────────────────
-    # .repeat() makes the generators infinite; steps_per_epoch/validation_steps
-    # tell Keras where each epoch boundary is.
-    effective_batch = batch_size * strategy.num_replicas_in_sync
-    steps_per_epoch  = n_train // effective_batch
-    validation_steps = n_val   // effective_batch
-
+    # from_tensor_slices gives a finite dataset — no .repeat() or
+    # steps_per_epoch needed; Keras iterates through all batches each epoch.
     keras_history = model.fit(
-        train_ds.repeat(),
-        validation_data=val_ds.repeat(),
+        train_ds,
+        validation_data=val_ds,
         epochs=epochs,
-        steps_per_epoch=steps_per_epoch,
-        validation_steps=validation_steps,
         callbacks=callbacks,
         verbose=1,
     )
@@ -226,6 +294,7 @@ def train_plnn(
         "train_loss":    train_losses,
         "val_loss":      val_losses,
         "epoch_times":   timer.epoch_times,
+        "throughput":    timer.throughput,
         "best_epoch":    best_epoch,
         "best_val_loss": min(val_losses),
     }
@@ -284,4 +353,5 @@ if __name__ == "__main__":
         f"\nTraining complete."
         f"  Best epoch: {result['best_epoch']}"
         f"  Best val loss: {result['best_val_loss']:.6f}"
+        f"  Avg throughput: {sum(result['throughput'])/len(result['throughput']):.0f} samples/sec"
     )

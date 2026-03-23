@@ -14,6 +14,18 @@ Noise types (spec §7.4):
   "white"  → P-LNN-100K       (white noise, alpha in [0.01, 0.15])
   "ar1"    → P-LNN-100K-AR1   (AR(1) noise, sigma in [0.01, 0.05])
   "both"   → P-LNN-100K-BOTH  (50/50 mix)
+
+Dataset modes
+-------------
+pregenerate=True  (default)
+    All samples are generated upfront into two numpy arrays
+    (X: float32 (n,252) ≈ 96 MB, Y: float32 (n,3) ≈ 1 MB for n=100 K).
+    tf.data.Dataset.from_tensor_slices eliminates the Python-generator
+    bottleneck so the GPU pipeline is no longer CPU-starved.
+
+pregenerate=False
+    Legacy streaming via tf.data.Dataset.from_generator.
+    Useful when RAM is limited.
 """
 
 from __future__ import annotations
@@ -119,61 +131,101 @@ def generate_plnn_sample(
     return series, label
 
 
+def pregenerate_arrays(
+    noise_type: str,
+    n_samples: int,
+    seed: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pre-generate all samples into contiguous numpy arrays.
+
+    Parameters
+    ----------
+    noise_type : {"white", "ar1", "both"}
+    n_samples : int
+    seed : int, optional
+
+    Returns
+    -------
+    X : np.ndarray, shape (n_samples, 252), float32
+    Y : np.ndarray, shape (n_samples, 3),   float32
+        Labels [tc, m, omega] in natural units.
+    """
+    X = np.empty((n_samples, SERIES_LEN), dtype=np.float32)
+    Y = np.empty((n_samples, 3),          dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    i = 0
+    while i < n_samples:
+        result = generate_plnn_sample(noise_type, rng)
+        if result is None:
+            continue
+        X[i], Y[i] = result
+        i += 1
+    return X, Y
+
+
 def make_tf_dataset(
     noise_type: str,
     n_samples: int,
     batch_size: int = 8,
     seed: int | None = None,
     shuffle: bool = True,
+    pregenerate: bool = True,
 ) -> tf.data.Dataset:
     """Build a tf.data.Dataset of (series, label) pairs.
-
-    Samples are generated lazily on-the-fly — no large arrays held in memory.
 
     Parameters
     ----------
     noise_type : {"white", "ar1", "both"}
     n_samples : int
-        Total samples to generate (NaN/rejected samples are regenerated).
     batch_size : int
         Spec §6.4: 8.
     seed : int, optional
     shuffle : bool
         Shuffle before batching (recommended for training set).
+    pregenerate : bool
+        If True (default), generate all samples upfront into numpy arrays
+        and use from_tensor_slices — eliminates the Python-generator CPU
+        bottleneck that starves the GPU.  Uses ~(n * 252 * 4) bytes of RAM
+        (≈ 96 MB for n=100 K).
+        If False, use the legacy from_generator streaming pipeline.
 
     Returns
     -------
     tf.data.Dataset
-        Yields (series_batch, label_batch) tuples of shape
-        ((batch, 252), (batch, 3)).
+        Yields (series_batch, label_batch) of shape ((batch,252), (batch,3)).
     """
     if noise_type not in ("white", "ar1", "both"):
         raise ValueError(f"noise_type must be 'white', 'ar1', or 'both'; got {noise_type!r}")
 
-    def generator():
-        rng = np.random.default_rng(seed)
-        yielded = 0
-        while yielded < n_samples:
-            result = generate_plnn_sample(noise_type, rng)
-            if result is None:
-                continue
-            series, label = result
-            yield series, label
-            yielded += 1
+    if pregenerate:
+        X, Y = pregenerate_arrays(noise_type, n_samples, seed=seed)
+        ds = tf.data.Dataset.from_tensor_slices((X, Y))
+        if shuffle:
+            # reshuffle_each_iteration=True (default) gives a fresh permutation
+            # every epoch without needing .repeat() + steps_per_epoch.
+            ds = ds.shuffle(buffer_size=n_samples, seed=seed)
+    else:
+        # ── Legacy streaming path ──────────────────────────────────────────
+        def generator():
+            rng = np.random.default_rng(seed)
+            yielded = 0
+            while yielded < n_samples:
+                result = generate_plnn_sample(noise_type, rng)
+                if result is None:
+                    continue
+                yield result
+                yielded += 1
 
-    ds = tf.data.Dataset.from_generator(
-        generator,
-        output_signature=(
-            tf.TensorSpec(shape=(SERIES_LEN,), dtype=tf.float32),
-            tf.TensorSpec(shape=(3,),          dtype=tf.float32),
-        ),
-    )
+        ds = tf.data.Dataset.from_generator(
+            generator,
+            output_signature=(
+                tf.TensorSpec(shape=(SERIES_LEN,), dtype=tf.float32),
+                tf.TensorSpec(shape=(3,),          dtype=tf.float32),
+            ),
+        )
+        if shuffle:
+            ds = ds.shuffle(buffer_size=min(n_samples, 10_000), seed=seed)
 
-    if shuffle:
-        ds = ds.shuffle(buffer_size=min(n_samples, 10_000), seed=seed)
-
-    # drop_remainder=True ensures every batch has exactly batch_size samples.
-    # Without it, the shuffle buffer can carry leftover samples across the
-    # generator's repeat boundary, creating uneven per-replica sub-batches
-    # that cause AddN shape mismatches in MirroredStrategy gradient aggregation.
+    # drop_remainder=True: every batch is exactly batch_size samples,
+    # preventing uneven per-replica splits in MirroredStrategy.
     return ds.batch(batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
